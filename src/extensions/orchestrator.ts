@@ -58,7 +58,7 @@ const runtime: RuntimeState = {
 };
 
 const MAX_RECENT_EVENTS = 20;
-const SUMMARY_LOG_LINES = 2;
+const SUMMARY_LOG_LINES = 5;
 
 export default function archagentOrchestrator(pi: ExtensionAPI): void {
   let pendingCheckpointResolve: ((d: CheckpointDecision) => void) | null = null;
