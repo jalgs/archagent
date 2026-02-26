@@ -36,19 +36,45 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.postCycleUpdate = postCycleUpdate;
 const ab = __importStar(require("./archbase"));
 const health_map_1 = require("./health-map");
+const artifact_meta_1 = require("./artifact-meta");
+const ddr_index_1 = require("./ddr-index");
+/**
+ * Applies deterministic updates after a Verify run.
+ *
+ * - Updates Health Map
+ * - Extracts debt
+ * - Updates DDR index (only if ddrPath is provided)
+ * - Archives and clears the current audit report
+ */
 function postCycleUpdate(zone, ddrPath) {
     const auditReport = ab.readAuditReport();
     if (!auditReport.trim())
         return;
-    (0, health_map_1.updateZoneFromAuditReport)(zone, auditReport);
-    extractDebtEntries(auditReport, zone);
-    markDDRImplemented(ddrPath);
+    const meta = (0, artifact_meta_1.parseAuditMeta)(auditReport);
+    (0, health_map_1.updateZoneFromAuditReport)(zone, auditReport, meta);
+    extractDebtEntries(auditReport, zone, meta);
+    if (ddrPath) {
+        markDDRImplemented(ddrPath);
+    }
     cleanWorkflowTemp();
 }
-function extractDebtEntries(report, zone) {
+function extractDebtEntries(report, zone, meta) {
+    const date = new Date().toISOString().split("T")[0];
+    // Preferred: debt from meta (deterministic)
+    const items = meta?.advisories?.map((s) => s.trim()).filter(Boolean) ?? [];
+    if (items.length > 0) {
+        for (const content of items) {
+            const existing = ab.readIfExists(ab.paths.health.debt);
+            if (existing.includes(content.slice(0, 60)))
+                continue;
+            const entry = `\n## [OPEN] ${date} — ${zone}\n${content}\n_Source: audit(meta)_\n`;
+            ab.appendDebt(entry);
+        }
+        return;
+    }
+    // Fallback: legacy marker-based parsing
     const advisoryPattern = /\[ADVISORY\](.*?)(?=\[ADVISORY\]|\[BLOCKING\]|$)/gs;
     const matches = report.matchAll(advisoryPattern);
-    const date = new Date().toISOString().split("T")[0];
     for (const match of matches) {
         const content = match[1]?.trim();
         if (!content)
@@ -56,17 +82,15 @@ function extractDebtEntries(report, zone) {
         const existing = ab.readIfExists(ab.paths.health.debt);
         if (existing.includes(content.slice(0, 60)))
             continue;
-        const entry = `\n## [OPEN] ${date} — ${zone}\n${content}\n_Source: audit cycle_\n`;
+        const entry = `\n## [OPEN] ${date} — ${zone}\n${content}\n_Source: audit(legacy)_\n`;
         ab.appendDebt(entry);
     }
 }
 function markDDRImplemented(ddrPath) {
-    const index = ab.readIfExists(ab.paths.decisions.index);
-    const filename = ddrPath.split("/").pop() ?? "";
-    const updated = index.replace(new RegExp(`(${filename}.*?)(approved)`, "i"), "$1implemented");
-    if (updated !== index) {
-        ab.write(ab.paths.decisions.index, updated);
-    }
+    // Update DDR header status
+    (0, ddr_index_1.setDdrStatus)(ddrPath, "IMPLEMENTED");
+    // Update index line
+    (0, ddr_index_1.upsertDdrIndex)(ddrPath);
 }
 function cleanWorkflowTemp() {
     const report = ab.readIfExists(ab.paths.workflow.auditReport);

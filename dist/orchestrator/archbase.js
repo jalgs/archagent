@@ -41,6 +41,7 @@ exports.writeHealthMap = writeHealthMap;
 exports.readWorkflowState = readWorkflowState;
 exports.writeWorkflowState = writeWorkflowState;
 exports.nextDDRNumber = nextDDRNumber;
+exports.findLatestDDRPath = findLatestDDRPath;
 exports.archiveDDR = archiveDDR;
 exports.readProjectContext = readProjectContext;
 exports.readZoneDetail = readZoneDetail;
@@ -90,6 +91,8 @@ exports.paths = {
         lock: `${ARCHBASE}/workflow/.lock`,
         logsDir: `${ARCHBASE}/workflow/logs`,
         runLogCurrent: `${ARCHBASE}/workflow/logs/run-current.log`,
+        modifiedFilesCurrent: `${ARCHBASE}/workflow/logs/modified-files-current.jsonl`,
+        actIntentCurrent: `${ARCHBASE}/workflow/act-intent-current.md`,
     },
     agents: `${ARCHBASE}/AGENTS.md`,
 };
@@ -114,6 +117,9 @@ function init(repoName) {
     writeIfNotExists(exports.paths.health.metrics, "# Architecture Metrics\n");
     writeIfNotExists(exports.paths.decisions.index, "# DDR Index\n");
     writeIfNotExists(exports.paths.workflow.auditReport, "");
+    writeIfNotExists(exports.paths.workflow.actIntentCurrent, "# Act Intent Log\n\n");
+    writeIfNotExists(exports.paths.workflow.runLogCurrent, "");
+    writeIfNotExists(exports.paths.workflow.modifiedFilesCurrent, "");
     if (!exists(exports.paths.workflow.state)) {
         writeWorkflowState({
             status: "idle",
@@ -175,6 +181,22 @@ function nextDDRNumber() {
         return 1;
     const nums = files.map((f) => Number.parseInt(f.match(/\d+/)?.[0] ?? "1", 10));
     return Math.max(...nums) + 1;
+}
+function findLatestDDRPath() {
+    const dir = exports.paths.decisions.dir;
+    if (!fs.existsSync(dir))
+        return null;
+    const files = fs
+        .readdirSync(dir)
+        .filter((f) => /^DDR-\d+\.md$/.test(f))
+        .map((f) => ({
+        file: f,
+        mtimeMs: fs.statSync(path.join(dir, f)).mtimeMs,
+    }))
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    if (files.length === 0)
+        return null;
+    return path.join(dir, files[0].file);
 }
 function archiveDDR(ddrPath) {
     const filename = path.basename(ddrPath);

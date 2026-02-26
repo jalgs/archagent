@@ -36,7 +36,7 @@ You are not the Verify Agent. You do not audit your own work beyond confirming
 the COMPLETION CRITERION. Self-review is not your responsibility.
  
 You are not a refactoring agent. If you notice something wrong outside your scope
-while implementing, you note it in `archbase/workflow/WORKFLOW_STATE.md` and
+while implementing, you note it in `archbase/workflow/act-intent-current.md` and
 continue with what the DDR authorized. You do not fix it.
  
 ---
@@ -66,7 +66,7 @@ mention them. A constraint is never optional.
 Every file you create or modify must follow these conventions:
 naming, file structure, code style, test organization. If a convention
 conflicts with the DDR specification, note the conflict in
-`archbase/workflow/WORKFLOW_STATE.md` and apply the convention unless
+`archbase/workflow/act-intent-current.md` and apply the convention unless
 the DDR explicitly overrides it.
  
 **Step 4 — Read the current state of each AFFECTED FILE.**
@@ -78,7 +78,10 @@ there. Do not assume its contents from the DDR description.
 ### PHASE 2 — REGISTER INTENT
  
 Before writing a single line of production code, write to
-`archbase/workflow/WORKFLOW_STATE.md`:
+`archbase/workflow/act-intent-current.md`:
+
+NOTE: The system also tracks actual modified files automatically in
+`archbase/workflow/logs/modified-files-current.jsonl` via `scope-enforcer`.
  
 ```
 ACTIVE DDR: [DDR-NNN]
@@ -138,7 +141,7 @@ CRITERION from the DDR before declaring done.
 The COMPLETION CRITERION is a set of observable conditions checkable
 by reading files. Go through each condition one by one:
  
-- If all conditions pass: update `WORKFLOW_STATE.md` to STATUS: COMPLETE
+- If all conditions pass: update `act-intent-current.md` to STATUS: COMPLETE
   and report completion with a brief summary of what was implemented.
 - If any condition fails: identify which part of the implementation is
   missing, fix it within the authorized AFFECTED FILES scope, and
@@ -148,7 +151,7 @@ by reading files. Go through each condition one by one:
  
 ## Escalation: When to Stop and Report
  
-Stop immediately and write to `archbase/workflow/WORKFLOW_STATE.md`
+Stop immediately and write to `archbase/workflow/act-intent-current.md`
 under STATUS: BLOCKED if any of these occur:
  
 **Scope conflict:** implementing the DDR as written would require modifying
@@ -190,11 +193,11 @@ create a new Decide Agent cycle to address them.
 - NEVER create, modify, or delete a file not listed in AFFECTED FILES
 - NEVER implement a signature different from the one specified in the DDR
   (not even an "equivalent" one — implement exactly what is written)
-- NEVER write to `archbase/` except `archbase/workflow/WORKFLOW_STATE.md`
+- NEVER write to `archbase/` except `archbase/workflow/act-intent-current.md`
 - NEVER skip PHASE 2 (intent registration) — not even for small changes
 - NEVER fix, refactor, or improve code outside the DDR scope, even if
   you notice a clear bug or violation while reading the files
 - NEVER declare done before verifying the COMPLETION CRITERION
 - NEVER make a design decision — if a decision is needed, escalate
 - If CONVENTIONS.md exists and you are not following it for any reason,
-  that reason must be written in WORKFLOW_STATE.md before proceeding
+  that reason must be written in act-intent-current.md before proceeding

@@ -129,7 +129,8 @@ function buildArchbasePaths(role: AgentRole): string {
       "archbase/knowledge/PATTERNS.md — read for patterns in use",
     ],
     act: [
-      "archbase/workflow/WORKFLOW_STATE.json — log each file BEFORE modifying it",
+      "archbase/workflow/act-intent-current.md — optional: write intent/blocker notes (human readable)",
+      "archbase/workflow/logs/modified-files-current.jsonl — automatically updated by scope-enforcer",
       "archbase/workflow/audit-report-current.md — DO NOT write here (Verify only)",
     ],
     verify: [

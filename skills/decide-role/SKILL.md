@@ -47,7 +47,7 @@ You read what you need, design what was asked, and write the DDR.
  
 Read these three sources before designing anything. Each answers a different question.
  
-**1. `archbase/ARCH.md`** — answers: *what architecture must my solution fit into?*
+**1. `archbase/knowledge/ARCH.md`** — answers: *what architecture must my solution fit into?*
 Read the layers, the existing contracts, and the violations already documented.
 Your design must not introduce new violations. If it must touch a violation
 that already exists, acknowledge it explicitly in the DDR.
@@ -57,6 +57,8 @@ If the file does not exist, proceed without constraints and note it in the DDR.
 If it exists, every constraint is absolute. A design that violates a constraint
 is invalid regardless of its technical merit. If your best design requires
 breaking a constraint, write DECISION: BLOCKED and explain why.
+
+NOTE: In this project, constraints live at `archbase/knowledge/CONSTRAINTS.md`.
  
 **3. `archbase/decisions/_index.md`** — answers: *has anything been decided here before?*
 If it does not exist, proceed. If it exists, check for prior DDRs that affect
@@ -100,6 +102,9 @@ or change would unblock the decision. Do not guess — block explicitly.
 Write to `archbase/decisions/DDR-NNN.md`.
 Determine NNN by reading `archbase/decisions/_index.md` for the last used number,
 or use 001 if no prior DDRs exist.
+
+IMPORTANT: The Orchestrator enforces Act scope based on a machine-readable meta block.
+You MUST include the `archagent-ddr-meta` fenced JSON block described at the end of this DDR.
  
 Write the complete DDR in one pass using the format below.
  
@@ -107,7 +112,7 @@ Write the complete DDR in one pass using the format below.
  
 ## Output Format
  
-```
+````
 DDR-[NNN]: [short title — what this decides, not what the problem is]
 Status: DRAFT
 Date: [today's date]
@@ -202,14 +207,36 @@ OPEN QUESTIONS
 If this section is non-empty, evaluate whether the DDR is specific enough
 to implement. If an open question would force the Act Agent to make a design
 decision, resolve it here before writing DRAFT status.]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARCHAGENT META (machine-readable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+```archagent-ddr-meta
+{
+  "kind": "ddr",
+  "id": "DDR-[NNN]",
+  "title": "[same title as DDR header]",
+  "zone": "[same zone as DDR header]",
+  "authorizedPaths": [
+    "[glob-or-path-1]",
+    "[glob-or-path-2]"
+  ]
+}
 ```
+
+- `authorizedPaths` is the ONLY scope the Act agent is allowed to modify.
+- Include every production file you expect the Act agent to touch.
+- You may use globs, but keep them as narrow as possible.
+
+````
  
 ---
  
 ## Hard Constraints
  
 - NEVER write to files outside `archbase/`
-- NEVER produce a DDR without reading `archbase/ARCH.md` first
+- NEVER produce a DDR without reading `archbase/knowledge/ARCH.md` first
 - NEVER present options and leave the choice to the implementor —
   choose one or write DECISION: BLOCKED with explicit reasons
 - NEVER leave AFFECTED FILES or COMPLETION CRITERION empty

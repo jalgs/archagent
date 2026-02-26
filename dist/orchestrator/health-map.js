@@ -44,7 +44,7 @@ function readZoneHealth(zone) {
         return null;
     return map.zones[zone] ?? null;
 }
-function updateZoneFromAuditReport(zone, auditReportContent) {
+function updateZoneFromAuditReport(zone, auditReportContent, meta) {
     const map = ab.readHealthMap() ?? {
         version: "1.0",
         repo: zone,
@@ -52,7 +52,7 @@ function updateZoneFromAuditReport(zone, auditReportContent) {
         updatedAt: new Date().toISOString(),
     };
     const current = map.zones[zone] ?? defaultZoneHealth(zone);
-    const updated = applyAuditReport(current, auditReportContent);
+    const updated = applyAuditReport(current, auditReportContent, meta ?? undefined);
     map.zones[zone] = updated;
     ab.writeHealthMap(map);
 }
@@ -78,11 +78,13 @@ function isZoneStale(zone) {
         return daysOld > 14;
     });
 }
-function applyAuditReport(current, report) {
-    const blockingCount = (report.match(/^## BLOCKING/gm) ?? []).length + countPattern(report, /\[BLOCKING\]/gi);
-    const advisoryCount = countPattern(report, /\[ADVISORY\]/gi);
-    const regressionFailed = report.includes("[REGRESSION-FAILED]");
-    const directionOk = !report.includes("[DIRECTION-REGRESSION]");
+function applyAuditReport(current, report, meta) {
+    const blockingCount = meta?.blockingCount ??
+        (report.match(/^## BLOCKING/gm) ?? []).length + countPattern(report, /\[BLOCKING\]/gi);
+    const advisoryCount = meta?.advisoryCount ?? countPattern(report, /\[ADVISORY\]/gi);
+    const regressionFailed = meta?.regressionFailed ?? report.includes("[REGRESSION-FAILED]");
+    // directionRegression=true means not ok
+    const directionOk = meta?.directionRegression != null ? !meta.directionRegression : !report.includes("[DIRECTION-REGRESSION]");
     const updated = {
         ...current,
         dimensions: {

@@ -39,6 +39,8 @@ export const paths = {
     lock: `${ARCHBASE}/workflow/.lock`,
     logsDir: `${ARCHBASE}/workflow/logs`,
     runLogCurrent: `${ARCHBASE}/workflow/logs/run-current.log`,
+    modifiedFilesCurrent: `${ARCHBASE}/workflow/logs/modified-files-current.jsonl`,
+    actIntentCurrent: `${ARCHBASE}/workflow/act-intent-current.md`,
   },
   agents: `${ARCHBASE}/AGENTS.md`,
 };
@@ -66,6 +68,9 @@ export function init(repoName: string): void {
   writeIfNotExists(paths.health.metrics, "# Architecture Metrics\n");
   writeIfNotExists(paths.decisions.index, "# DDR Index\n");
   writeIfNotExists(paths.workflow.auditReport, "");
+  writeIfNotExists(paths.workflow.actIntentCurrent, "# Act Intent Log\n\n");
+  writeIfNotExists(paths.workflow.runLogCurrent, "");
+  writeIfNotExists(paths.workflow.modifiedFilesCurrent, "");
 
   if (!exists(paths.workflow.state)) {
     writeWorkflowState({
@@ -133,6 +138,23 @@ export function nextDDRNumber(): number {
   if (files.length === 0) return 1;
   const nums = files.map((f) => Number.parseInt(f.match(/\d+/)?.[0] ?? "1", 10));
   return Math.max(...nums) + 1;
+}
+
+export function findLatestDDRPath(): string | null {
+  const dir = paths.decisions.dir;
+  if (!fs.existsSync(dir)) return null;
+
+  const files = fs
+    .readdirSync(dir)
+    .filter((f) => /^DDR-\d+\.md$/.test(f))
+    .map((f) => ({
+      file: f,
+      mtimeMs: fs.statSync(path.join(dir, f)).mtimeMs,
+    }))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  if (files.length === 0) return null;
+  return path.join(dir, files[0]!.file);
 }
 
 export function archiveDDR(ddrPath: string): void {

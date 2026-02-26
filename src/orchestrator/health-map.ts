@@ -1,5 +1,6 @@
 import * as ab from "./archbase";
 import type { DimensionProfile, HealthMap, HealthStatus, ZoneHealth } from "../types";
+import type { AuditMeta } from "./artifact-meta";
 
 export function readZoneHealth(zone: string): ZoneHealth | null {
   const map = ab.readHealthMap();
@@ -7,7 +8,7 @@ export function readZoneHealth(zone: string): ZoneHealth | null {
   return map.zones[zone] ?? null;
 }
 
-export function updateZoneFromAuditReport(zone: string, auditReportContent: string): void {
+export function updateZoneFromAuditReport(zone: string, auditReportContent: string, meta?: AuditMeta | null): void {
   const map: HealthMap =
     ab.readHealthMap() ?? {
       version: "1.0",
@@ -17,7 +18,7 @@ export function updateZoneFromAuditReport(zone: string, auditReportContent: stri
     };
 
   const current = map.zones[zone] ?? defaultZoneHealth(zone);
-  const updated = applyAuditReport(current, auditReportContent);
+  const updated = applyAuditReport(current, auditReportContent, meta ?? undefined);
   map.zones[zone] = updated;
   ab.writeHealthMap(map);
 }
@@ -46,11 +47,17 @@ export function isZoneStale(zone: string): boolean {
   });
 }
 
-function applyAuditReport(current: ZoneHealth, report: string): ZoneHealth {
-  const blockingCount = (report.match(/^## BLOCKING/gm) ?? []).length + countPattern(report, /\[BLOCKING\]/gi);
-  const advisoryCount = countPattern(report, /\[ADVISORY\]/gi);
-  const regressionFailed = report.includes("[REGRESSION-FAILED]");
-  const directionOk = !report.includes("[DIRECTION-REGRESSION]");
+function applyAuditReport(current: ZoneHealth, report: string, meta?: import("./artifact-meta").AuditMeta): ZoneHealth {
+  const blockingCount =
+    meta?.blockingCount ??
+    (report.match(/^## BLOCKING/gm) ?? []).length + countPattern(report, /\[BLOCKING\]/gi);
+
+  const advisoryCount = meta?.advisoryCount ?? countPattern(report, /\[ADVISORY\]/gi);
+
+  const regressionFailed = meta?.regressionFailed ?? report.includes("[REGRESSION-FAILED]");
+
+  // directionRegression=true means not ok
+  const directionOk = meta?.directionRegression != null ? !meta.directionRegression : !report.includes("[DIRECTION-REGRESSION]");
 
   const updated: ZoneHealth = {
     ...current,

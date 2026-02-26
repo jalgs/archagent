@@ -57,7 +57,7 @@ Extract from the DDR:
 - COMPLETION CRITERION: the conditions the implementation must satisfy
 - DEPENDENCY DIRECTION AFTER CHANGE: the layer structure to verify
  
-**Step 2 — Read `archbase/ARCH.md`.**
+**Step 2 — Read `archbase/knowledge/ARCH.md`.**
 Understand the architectural layers, existing patterns, and documented
 violations. This gives you the baseline against which to detect regressions.
  
@@ -149,7 +149,7 @@ Write the complete report in one pass using the format below.
  
 ## Output Format
  
-```
+````
 AUDIT REPORT
 DDR: [DDR-NNN — title]
 Date: [today]
@@ -244,7 +244,34 @@ DIRECTOR NOTES
 [Optional. Use only for context the Director needs that does not fit
 neatly into the dimensions above. Maximum three sentences.
 If nothing to add, omit this section entirely.]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARCHAGENT META (machine-readable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+```archagent-audit-meta
+{
+  "kind": "audit",
+  "ddrId": "DDR-NNN",
+  "zone": "[same zone as report header]",
+  "verdict": "APPROVED | APPROVED WITH ADVISORIES | REJECTED",
+  "blockingCount": 0,
+  "advisoryCount": 0,
+  "regressionFailed": false,
+  "directionRegression": false,
+  "advisories": [
+    "[one-line advisory item to record as debt]"
+  ]
+}
 ```
+
+Rules for meta:
+- `blockingCount` and `advisoryCount` MUST match the report counts.
+- Set `regressionFailed=true` if any regression issue is BLOCKING.
+- Set `directionRegression=true` if the change moves away from ARCH_TARGET / intended direction.
+- `advisories` MUST be a list of short, standalone items suitable for DEBT.md.
+
+````
  
 ---
  

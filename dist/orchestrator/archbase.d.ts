@@ -34,6 +34,8 @@ export declare const paths: {
         lock: string;
         logsDir: string;
         runLogCurrent: string;
+        modifiedFilesCurrent: string;
+        actIntentCurrent: string;
     };
     agents: string;
 };
@@ -44,6 +46,7 @@ export declare function writeHealthMap(map: HealthMap): void;
 export declare function readWorkflowState(): WorkflowState;
 export declare function writeWorkflowState(state: WorkflowState): void;
 export declare function nextDDRNumber(): number;
+export declare function findLatestDDRPath(): string | null;
 export declare function archiveDDR(ddrPath: string): void;
 export interface ProjectContext {
     constraints: string;

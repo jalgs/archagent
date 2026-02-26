@@ -1,13 +1,24 @@
 import * as fs from "node:fs";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Box, Key, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { runStep, type StepTelemetry } from "../orchestrator/agent-runner";
+
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Box, Spacer, Text, truncateToWidth } from "@mariozechner/pi-tui";
+
 import * as ab from "../orchestrator/archbase";
+import { runStep, type StepTelemetry } from "../orchestrator/agent-runner";
 import { configurePipeline } from "../orchestrator/pipeline";
 import { postCycleUpdate } from "../orchestrator/post-cycle";
+import { parseDdrMeta } from "../orchestrator/artifact-meta";
+import { setDdrStatus, upsertDdrIndex } from "../orchestrator/ddr-index";
+import { DirectorInterface, type DirectorAction } from "../orchestrator/director-interface";
 import type { CheckpointDecision, Pipeline, WorkflowState } from "../types";
 
 type RuntimeViewMode = "compact" | "expanded";
+
+type UiVisibility = {
+  visible: boolean;
+  showLogs: boolean;
+  showStatus: boolean;
+};
 
 interface CheckpointView {
   label: string;
@@ -30,19 +41,37 @@ interface SubagentRuntime {
 }
 
 interface RuntimeState {
-  verbose: boolean;
+  // Master enable switch for ArchAgent UI/shortcuts/status
+  archEnabled: boolean;
+  // Director conversation mode (intercepts normal input)
+  directorEnabled: boolean;
+
   viewMode: RuntimeViewMode;
   logsExpanded: boolean;
+  ui: UiVisibility;
+
   recentEvents: string[];
   lastEvent?: string;
+
   checkpointView?: CheckpointView;
   subagent: SubagentRuntime;
+
+  // UI animation
+  spinnerIndex: number;
 }
 
 const runtime: RuntimeState = {
-  verbose: false,
+  archEnabled: false,
+  directorEnabled: false,
+
   viewMode: "compact",
   logsExpanded: false,
+  ui: {
+    visible: false,
+    showLogs: true,
+    showStatus: true,
+  },
+
   recentEvents: [],
   checkpointView: undefined,
   subagent: {
@@ -55,13 +84,50 @@ const runtime: RuntimeState = {
     cost: 0,
     contextTokens: 0,
   },
+
+  spinnerIndex: 0,
 };
 
-const MAX_RECENT_EVENTS = 20;
-const SUMMARY_LOG_LINES = 5;
+const MAX_RECENT_EVENTS = 30;
+const SUMMARY_LOG_LINES = 6;
 
 export default function archagentOrchestrator(pi: ExtensionAPI): void {
+  const director = new DirectorInterface();
   let pendingCheckpointResolve: ((d: CheckpointDecision) => void) | null = null;
+
+  let lastUiCtx: ExtensionContext | null = null;
+  const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+
+  // Opt-in activation.
+  // - Default: ArchAgent stays dormant (Pi behaves normally)
+  // - Enable: run /arch:director, or set ARCHAGENT=1, or (if Pi allows) pass --arch
+  const autoEnable = process.env.ARCHAGENT === "1" || process.argv.includes("--arch");
+  if (autoEnable) {
+    runtime.archEnabled = true;
+    runtime.directorEnabled = true;
+    runtime.ui.visible = true;
+  }
+
+  // Custom message renderers (nicer labels)
+  pi.registerMessageRenderer("archagent-director", (message, _options, theme) => {
+    const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+    box.addChild(new Text(theme.fg("customMessageLabel", theme.bold("Arch Director")), 0, 0));
+    box.addChild(new Spacer(1));
+    box.addChild(new Text(theme.fg("customMessageText", extractCustomMessageText(message.content)), 0, 0));
+    return box;
+  });
+
+  pi.registerMessageRenderer("archagent-director-user", (message, _options, theme) => {
+    const box = new Box(1, 1, (t) => theme.bg("userMessageBg", t));
+    box.addChild(new Text(theme.fg("customMessageLabel", theme.bold("User")), 0, 0));
+    box.addChild(new Spacer(1));
+    box.addChild(new Text(theme.fg("customMessageText", extractCustomMessageText(message.content)), 0, 0));
+    return box;
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // State + logging
+  // ────────────────────────────────────────────────────────────────────────────
 
   function recordEvent(message: string, ctx?: ExtensionContext): void {
     runtime.lastEvent = message;
@@ -69,19 +135,15 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
     if (runtime.recentEvents.length > MAX_RECENT_EVENTS) {
       runtime.recentEvents.splice(0, runtime.recentEvents.length - MAX_RECENT_EVENTS);
     }
-    // Ya NO escribimos eventos de usuario en el log del subagente
-    if (ctx) {
-      refreshRuntimeUi(ctx);
-    }
+    if (ctx) refreshUi(ctx);
   }
 
   function recordSubagentLog(message: string, ctx?: ExtensionContext): void {
+    tickSpinner();
     const line = `[${new Date().toISOString()}] ${message}`;
     const existing = ab.readIfExists(ab.paths.workflow.runLogCurrent);
     ab.write(ab.paths.workflow.runLogCurrent, `${existing}${existing ? "\n" : ""}${line}`);
-    if (ctx) {
-      refreshRuntimeUi(ctx);
-    }
+    if (ctx) refreshUi(ctx);
   }
 
   function formatTokens(n: number): string {
@@ -94,6 +156,7 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
   function resetSubagent(): void {
     runtime.subagent.active = false;
     runtime.subagent.role = undefined;
+    runtime.subagent.model = undefined;
     runtime.subagent.turns = 0;
     runtime.subagent.input = 0;
     runtime.subagent.output = 0;
@@ -101,6 +164,11 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
     runtime.subagent.cacheWrite = 0;
     runtime.subagent.cost = 0;
     runtime.subagent.contextTokens = 0;
+  }
+
+  function tickSpinner(): void {
+    if (!runtime.subagent.active) return;
+    runtime.spinnerIndex = (runtime.spinnerIndex + 1) % SPINNER_FRAMES.length;
   }
 
   function applyTelemetry(data: StepTelemetry): void {
@@ -115,259 +183,197 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
     runtime.subagent.cost = data.cost;
     runtime.subagent.contextTokens = data.contextTokens;
     if (data.phase === "end") runtime.subagent.active = false;
+
+    tickSpinner();
   }
 
-  function installCustomFooter(ctx: ExtensionContext): void {
-    if (!ctx.hasUI) return;
-
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      const unsub = footerData.onBranchChange(() => tui.requestRender());
-      return {
-        dispose: unsub,
-        invalidate() {},
-        render(width: number): string[] {
-          const statuses = footerData.getExtensionStatuses();
-          const stateSummary = statuses.get("archagent") ?? "○ [idle] -";
-          const s = runtime.subagent;
-          const subPart = s.active
-            ? `sub:${s.role ?? "-"} ${s.model ?? "model?"} t:${s.turns} ↑${formatTokens(s.input)} ↓${formatTokens(s.output)} ctx:${formatTokens(s.contextTokens)} $${s.cost.toFixed(3)}`
-            : "sub:idle";
-
-          const mainUsage = ctx.getContextUsage();
-          const mainCtx = mainUsage?.tokens != null && mainUsage.percent != null
-            ? `main:${formatTokens(mainUsage.tokens)}/${formatTokens(mainUsage.contextWindow)} (${mainUsage.percent.toFixed(1)}%)`
-            : "main:—";
-
-          const branch = footerData.getGitBranch();
-          const right = `${ctx.model?.id ?? "no-model"}${branch ? ` • ${branch}` : ""}`;
-
-          const left = theme.fg("dim", `${stateSummary} | ${subPart} | ${mainCtx}`);
-          const rightStyled = theme.fg("dim", right);
-          const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(rightStyled)));
-          return [truncateToWidth(left + pad + rightStyled, width)];
-        },
-      };
-    });
-  }
-
-  function runDetached(ctx: ExtensionCommandContext, label: string, fn: () => Promise<void>): void {
-    recordEvent(`${label} queued`, ctx);
-    ctx.ui.notify(`${label} started in background. Use /arch:status to monitor.`, "info");
-    void (async () => {
-      try {
-        await fn();
-      } catch (err) {
-        recordEvent(`${label} crashed: ${String(err)}`, ctx);
-        ctx.ui.notify(`${label} crashed: ${String(err)}`, "error");
-      }
-    })();
-  }
+  // ────────────────────────────────────────────────────────────────────────────
+  // UI
+  // ────────────────────────────────────────────────────────────────────────────
 
   function getLogLines(full: boolean): string[] {
     const log = ab.readIfExists(ab.paths.workflow.runLogCurrent);
     const logLines = log.trim() ? log.split("\n") : ["(no log entries yet)"];
-    if (full) {
-      // Limit to last 500 lines even in "full" mode to keep UI responsive
-      return logLines.slice(-500);
-    }
+    if (full) return logLines.slice(-500);
     return logLines.slice(-SUMMARY_LOG_LINES);
   }
 
-  function renderOverviewWidget(ctx: ExtensionContext, state: WorkflowState): void {
+  function buildFooterStatus(state: WorkflowState, ctx: ExtensionContext): string {
+    const statusIcon = iconForStatus(state.status);
+    const role = state.currentRole ?? "-";
+
+    const usage = ctx.getContextUsage();
+    const mainCtx =
+      usage?.tokens != null && usage.percent != null
+        ? `main:${formatTokens(usage.tokens)}/${formatTokens(usage.contextWindow)} (${usage.percent.toFixed(0)}%)`
+        : "main:—";
+
+    const s = runtime.subagent;
+    const subPart = s.active
+      ? `sub:${s.role ?? "-"} t:${s.turns} ctx:${formatTokens(s.contextTokens)} $${s.cost.toFixed(3)}`
+      : "sub:idle";
+
+    // Keep it short: the built-in footer already shows model/git/etc.
+    const mode = runtime.directorEnabled ? "dir:on" : runtime.archEnabled ? "arch:on" : "arch:off";
+
+    return `${statusIcon} ArchAgent ${state.status} • ${role} • ${subPart} • ${mainCtx} • ${mode}`;
+  }
+
+  function refreshUi(ctx: ExtensionContext): void {
+    lastUiCtx = ctx;
+
+    const state = ab.readWorkflowState();
+
+    // Add extra info to Pi's built-in footer via setStatus().
+    // Do NOT overwrite the native footer with ctx.ui.setFooter().
+    if (runtime.archEnabled || state.status !== "idle") {
+      ctx.ui.setStatus("archagent", buildFooterStatus(state, ctx));
+    } else {
+      ctx.ui.setStatus("archagent", undefined);
+    }
+
+    if (!ctx.hasUI) return;
+
+    if (!runtime.ui.visible) {
+      ctx.ui.setWidget("archagent-logs", undefined);
+      ctx.ui.setWidget("archagent-status", undefined);
+      return;
+    }
+
+    if (runtime.ui.showLogs) {
+      renderLogsWidget(ctx, state);
+    } else {
+      ctx.ui.setWidget("archagent-logs", undefined);
+    }
+
+    if (runtime.ui.showStatus) {
+      renderStatusWidget(ctx, state);
+    } else {
+      ctx.ui.setWidget("archagent-status", undefined);
+    }
+  }
+
+  function renderLogsWidget(ctx: ExtensionContext, state: WorkflowState): void {
+    if (!ctx.hasUI) return;
+
+    ctx.ui.setWidget(
+      "archagent-logs",
+      (_tui, theme) => {
+        const box = new Box(1, 1, (t) => theme.bg("toolPendingBg", t));
+
+        // Checkpoint panel takes precedence
+        if (state.status === "waiting-checkpoint" && runtime.checkpointView) {
+          const cp = runtime.checkpointView;
+          const title = theme.fg("warning", theme.bold(`⏸ CHECKPOINT | ${cp.label}`));
+          const help = theme.fg(
+            "dim",
+            `Shortcuts: ${theme.fg("success", "Alt+Y")} approve • ${theme.fg("error", "Alt+N")} reject • ${theme.fg("warning", "Alt+M")} more-analysis`,
+          );
+
+          const body = [
+            `${theme.fg("dim", "Artifact:")} ${theme.fg("warning", cp.artifactPath)}`,
+            "",
+            theme.fg("accent", theme.bold("Summary")),
+            ...cp.summary.split("\n").map((l) => theme.fg("dim", l)),
+            "",
+            theme.fg("accent", theme.bold("Artifact preview")),
+            ...cp.artifactPreview.map((l) => theme.fg("dim", truncate(l, runtime.viewMode === "compact" ? 180 : 260))),
+          ];
+
+          box.addChild(new Text(`${title}\n${help}\n${theme.fg("dim", "────────────────────────────────────────────────────────")}\n${body.join("\n")}`, 0, 0));
+          return box;
+        }
+
+        const title = theme.fg(
+          runtime.logsExpanded ? "warning" : "accent",
+          theme.bold("SUB-AGENT LOGS"),
+        );
+        const subtitle = theme.fg(
+          "dim",
+          `${runtime.logsExpanded ? "FULL" : "SUMMARY"} • toggle full: Alt+O • hide logs: Alt+L • hide status: Alt+S`,
+        );
+
+        const raw = getLogLines(runtime.logsExpanded);
+        const rendered = raw.map((l) => formatLogLine(l, theme, runtime.logsExpanded, runtime.viewMode));
+
+        if (runtime.subagent.active) {
+          const spin = theme.fg("accent", SPINNER_FRAMES[runtime.spinnerIndex]);
+          rendered.push(theme.fg("dim", `${spin} Waiting...`));
+        }
+
+        // In FULL mode we do not truncate; Text will wrap by terminal width.
+        // In SUMMARY we pre-truncate for readability.
+        box.addChild(new Text(`${title}\n${subtitle}\n${theme.fg("dim", "────────────────────────────────────────────────────────")}\n${rendered.join("\n")}`, 0, 0));
+        return box;
+      },
+      { placement: "aboveEditor" },
+    );
+  }
+
+  function renderStatusWidget(ctx: ExtensionContext, state: WorkflowState): void {
     if (!ctx.hasUI) return;
 
     const statusIcon = iconForStatus(state.status);
     const role = state.currentRole ?? "-";
+
     const progress =
       state.currentStep && state.totalSteps
         ? `${state.currentStep}/${state.totalSteps} (done: ${state.lastCompletedStep ?? 0})`
         : "-";
 
     ctx.ui.setWidget(
-      "archagent-overview",
+      "archagent-status",
       (_tui, theme) => {
-        const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+        const box = new Box(1, 1, (t) => theme.bg("userMessageBg", t));
 
-        const leftTitle = theme.fg("accent", theme.bold("STATUS"));
-        const rightTitle = theme.fg("accent", theme.bold("CONTEXT"));
+        const statusTone = state.status === "failed" ? "error" : state.status === "waiting-checkpoint" ? "warning" : state.status === "completed" ? "success" : "accent";
 
-        const left = [
-          theme.fg(
-            state.status === "failed" ? "error" : state.status === "waiting-checkpoint" ? "warning" : "accent",
-            theme.bold(`${statusIcon} ArchAgent | ${state.status} | ${role} | ${progress}`),
-          ),
-          `Lock: ${readLockSummary()}`,
-          `Verbose: ${runtime.verbose ? theme.fg("success", "ON") : theme.fg("dim", "OFF")}`,
-          `View: ${runtime.viewMode}`,
-          `Flow logs: ${runtime.logsExpanded ? theme.fg("warning", "FULL") : theme.fg("accent", "SUMMARY")}`,
-          state.pendingCheckpoint ? `Checkpoint: ${theme.fg("warning", state.pendingCheckpoint.label)}` : "Checkpoint: -",
-        ];
-
-        const right = [
-          `Zone: ${theme.fg("accent", state.zone ?? "-")}`,
-          `Objective: ${truncate(state.currentObjective ?? "-", runtime.viewMode === "compact" ? 70 : 130)}`,
-          `Last event: ${theme.fg("accent", truncate(runtime.lastEvent ?? "-", runtime.viewMode === "compact" ? 70 : 130))}`,
-          `Role skill: ${runtime.subagent.role ?? role}`,
-          `Sub-model: ${runtime.subagent.model ?? "-"}`,
-          `Sub-usage: t:${runtime.subagent.turns} ↑${formatTokens(runtime.subagent.input)} ↓${formatTokens(runtime.subagent.output)} ctx:${formatTokens(runtime.subagent.contextTokens)} $${runtime.subagent.cost.toFixed(3)}`,
-        ];
-
-        if (runtime.viewMode === "expanded") {
-          right.push("");
-          const events = runtime.recentEvents.slice(-3);
-          if (events.length > 0) {
-            right.push(theme.fg("accent", "Recent director events:"));
-            right.push(...events.map((e) => theme.fg("dim", `• ${truncate(e, 120)}`)));
-          }
-        }
-
-        const leftWidth = runtime.viewMode === "compact" ? 64 : 78;
-        const rows = Math.max(left.length, right.length);
-        const lineRows: string[] = [];
-        for (let i = 0; i < rows; i += 1) {
-          const l = left[i] ?? "";
-          const r = right[i] ?? "";
-          const pad = " ".repeat(Math.max(0, leftWidth - visibleWidth(l)));
-          lineRows.push(`${l}${pad} ${theme.fg("dim", "│")} ${r}`);
-        }
-
-        const headerPad = " ".repeat(Math.max(0, leftWidth - visibleWidth(leftTitle)));
-        const header = `${leftTitle}${headerPad} ${theme.fg("dim", "│")} ${rightTitle}`;
-        const sep = `${theme.fg("dim", "─".repeat(Math.max(24, leftWidth)))}${theme.fg("dim", "┼")}${theme.fg("dim", "─".repeat(runtime.viewMode === "compact" ? 30 : 66))}`;
-
-        box.addChild(new Text(`${header}\n${sep}\n${lineRows.join("\n")}`, 0, 0));
-        return box;
-      },
-      { placement: "aboveEditor" },
-    );
-  }
-
-  function renderFlowWidget(ctx: ExtensionContext, state: WorkflowState): void {
-    if (!ctx.hasUI) return;
-
-    ctx.ui.setWidget(
-      "archagent-flow",
-      (_tui, theme) => {
-        const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-
-        const colorizeLog = (line: string): string => {
-          const m = line.match(/^\[(.*?)\]\s*(.*)$/);
-          const ts = m ? m[1] : "";
-          const msg = m ? m[2] : line;
-
-          let tone: "accent" | "warning" | "error" | "success" | "dim" = "accent";
-          let marker = "●";
-          const low = msg.toLowerCase();
-          if (low.includes("failed") || low.includes("error") || low.includes("crashed")) {
-            tone = "error";
-            marker = "✖";
-          } else if (low.includes("checkpoint") || low.includes("waiting")) {
-            tone = "warning";
-            marker = "⏸";
-          } else if (low.includes("completed") || low.includes("approved") || low.includes("released") || low.includes("success")) {
-            tone = "success";
-            marker = "✓";
-          } else if (low.includes("queued") || low.includes("starting") || low.includes("step")) {
-            tone = "accent";
-            marker = "▶";
-          } else if (low.includes("→")) {
-            tone = "accent";
-            marker = "  →";
-          } else {
-            tone = "dim";
-            marker = "○";
-          }
-
-          const content = `${theme.fg(tone, marker)} ${theme.fg(tone, msg)}`;
-          if (!m) return content;
-          // Shorten timestamp to just time
-          const time = ts.includes("T") ? ts.split("T")[1].split(".")[0] : ts;
-          return `${theme.fg("dim", `[${time}]`)} ${content}`;
+        const row = (icon: string, tone: string, label: string, value: string) => {
+          const iconPart = theme.fg(tone as any, icon);
+          const labelPart = theme.fg("dim", label);
+          const valuePart = theme.fg("customMessageText", value);
+          return `${iconPart} ${labelPart} ${valuePart}`;
         };
 
-        if (state.status === "waiting-checkpoint" && runtime.checkpointView) {
-          const cp = runtime.checkpointView;
-          const title = theme.fg("warning", theme.bold(`⏸ SUB-AGENT CHECKPOINT | ${cp.label}`));
-          const summaryHead = theme.fg("accent", theme.bold("Summary"));
-          const actionsHead = theme.fg("accent", theme.bold("Director actions"));
-          const previewHead = theme.fg("accent", theme.bold("Artifact preview"));
-
-          const body = [
-            `${theme.fg("dim", "Artifact:")} ${theme.fg("warning", cp.artifactPath)}`,
-            "",
-            summaryHead,
-            ...cp.summary.split("\n").map((l) => theme.fg("dim", l)),
-            "",
-            actionsHead,
-            `${theme.fg("success", "•")} /arch:approve`,
-            `${theme.fg("error", "•")} /arch:reject <feedback>`,
-            `${theme.fg("warning", "•")} /arch:more-analysis <request>`,
-            "",
-            previewHead,
-            ...cp.artifactPreview.map((l) => theme.fg("dim", truncate(l, runtime.viewMode === "compact" ? 160 : 220))),
-          ];
-
-          box.addChild(new Text(`${title}\n${theme.fg("dim", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")}` + `\n${body.join("\n")}`, 0, 0));
-          return box;
-        }
+        // Headline uses the same icon style as logs: colored icon, normal text.
+        const headline = `${theme.fg(statusTone as any, statusIcon)} ${theme.bold("ArchAgent")} ${theme.fg("customMessageText", `${state.status} • ${role} • ${progress}`)}`;
 
         const s = runtime.subagent;
-        const title = theme.fg(runtime.logsExpanded ? "warning" : "accent", theme.bold("SUB-AGENT FLOW"));
-        const status = s.active ? theme.fg("warning", "RUNNING") : theme.fg("dim", "IDLE");
-        const role = theme.fg("accent", s.role ?? state.currentRole ?? "-");
-        const model = theme.fg("dim", s.model ?? "-");
+        const sub = s.active
+          ? `sub:${s.role ?? "-"} t:${s.turns} ↑${formatTokens(s.input)} ↓${formatTokens(s.output)} ctx:${formatTokens(s.contextTokens)} $${s.cost.toFixed(3)}`
+          : "sub:idle";
 
-        const telemetry = [
-          `${theme.fg("dim", "Status:")} ${status}    ${theme.fg("dim", "Role:")} ${role}    ${theme.fg("dim", "Model:")} ${model}`,
-          `${theme.fg("dim", "Turns:")} ${theme.fg("accent", `${s.turns}`)}    ${theme.fg("dim", "Input:")} ${theme.fg("accent", formatTokens(s.input))}    ${theme.fg("dim", "Output:")} ${theme.fg("accent", formatTokens(s.output))}`,
-          `${theme.fg("dim", "Cache R/W:")} ${theme.fg("accent", `${formatTokens(s.cacheRead)}/${formatTokens(s.cacheWrite)}`)}    ${theme.fg("dim", "Ctx:")} ${theme.fg("warning", formatTokens(s.contextTokens))}    ${theme.fg("dim", "Cost:")} ${theme.fg("success", `$${s.cost.toFixed(3)}`)}`,
-        ];
+        const rows: string[] = [
+          headline,
+          row("→", "accent", "Zone:", state.zone ?? "-"),
+          row("→", "accent", "Objective:", truncate(state.currentObjective ?? "-", runtime.viewMode === "compact" ? 90 : 140)),
+          row("→", "accent", "Lock:", readLockSummary()),
+          row(s.active ? "▶" : "○", s.active ? "accent" : "dim", "Sub-agent:", sub),
+          row("→", "accent", "Last:", truncate(runtime.lastEvent ?? "-", runtime.viewMode === "compact" ? 90 : 140)),
+          runtime.viewMode === "expanded"
+            ? theme.fg(
+                "dim",
+                `Recent: ${runtime.recentEvents.slice(-3).map((e) => truncate(e, 60)).join(" | ") || "-"}`,
+              )
+            : "",
+          theme.fg(
+            "dim",
+            `UI: Alt+U toggle • Alt+L logs • Alt+S status • Alt+V view • Alt+O full logs`,
+          ),
+        ].filter(Boolean);
 
-        const logLines = getLogLines(runtime.logsExpanded);
-        const logsHead = theme.fg("accent", theme.bold(runtime.logsExpanded ? "Live log stream (FULL)" : "Recent sub-agent activity"));
-        const renderedLogs = logLines.length > 0
-          ? logLines.map((l) => colorizeLog(truncate(l, runtime.viewMode === "compact" ? 180 : 260)))
-          : [theme.fg("dim", "(no sub-agent activity yet)")];
-
-        const body = [...telemetry];
-
-        if (runtime.logsExpanded || s.active) {
-          body.push("");
-          body.push(logsHead);
-          body.push(theme.fg("dim", "────────────────────────────────────────────────────────"));
-          body.push(...renderedLogs);
-        }
-
-        box.addChild(new Text(`${title}\n${theme.fg("dim", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")}\n${body.join("\n")}`, 0, 0));
+        box.addChild(new Text(rows.join("\n"), 0, 0));
         return box;
       },
-      { placement: "aboveEditor" },
+      { placement: "belowEditor" },
     );
   }
 
-  function refreshRuntimeUi(ctx: ExtensionContext): void {
-    const state = ab.readWorkflowState();
-    const statusIcon = iconForStatus(state.status);
-    const role = state.currentRole ?? "-";
+  // ────────────────────────────────────────────────────────────────────────────
+  // Locking
+  // ────────────────────────────────────────────────────────────────────────────
 
-    const footer = `${statusIcon} [${state.status}] ${role}`.trim();
-    ctx.ui.setStatus("archagent", footer || "idle");
-
-    if (!ctx.hasUI) return;
-
-    installCustomFooter(ctx);
-
-    // Ensure legacy/old widgets are always cleared.
-    ctx.ui.setWidget("archagent-output", undefined);
-    ctx.ui.setWidget("archagent-checkpoint", undefined);
-    ctx.ui.setWidget("archagent-state", undefined);
-    ctx.ui.setWidget("archagent-context", undefined);
-
-    renderOverviewWidget(ctx, state);
-    renderFlowWidget(ctx, state);
-  }
-
-  function tryAcquireWorkflowLock(command: string, ctx: ExtensionCommandContext): string | null {
+  function tryAcquireWorkflowLock(command: string, ctx: ExtensionContext): string | null {
     const lockPath = ab.paths.workflow.lock;
     if (ab.exists(lockPath)) {
       const lockRaw = ab.readIfExists(lockPath);
@@ -379,7 +385,7 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
         owner = lockRaw || "unknown";
       }
 
-      ctx.ui.notify(`Another workflow is active (lock held by ${owner}). Use /arch:status or /arch:abort.`, "warning");
+      ctx.ui.notify(`Another workflow is active (lock held by ${owner}).`, "warning");
       return null;
     }
 
@@ -425,16 +431,20 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
     recordEvent("Lock force-released", ctx);
   }
 
+  // ────────────────────────────────────────────────────────────────────────────
+  // Checkpoints
+  // ────────────────────────────────────────────────────────────────────────────
+
   function resolveCheckpoint(decision: CheckpointDecision, ctx?: ExtensionContext): boolean {
     if (!pendingCheckpointResolve) return false;
     pendingCheckpointResolve(decision);
     pendingCheckpointResolve = null;
     runtime.checkpointView = undefined;
-    if (ctx) refreshRuntimeUi(ctx);
+    if (ctx) refreshUi(ctx);
     return true;
   }
 
-  function makeCheckpointHandler(ctx: ExtensionCommandContext) {
+  function makeCheckpointHandler(ctx: ExtensionContext) {
     return async (label: string, artifactPath: string): Promise<CheckpointDecision> => {
       const content = ab.readIfExists(artifactPath);
       const summary = summarizeArtifact(artifactPath, content);
@@ -443,18 +453,18 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
         label,
         artifactPath,
         summary,
-        artifactPreview: toWidgetLines(content || "(empty file)", 220),
+        artifactPreview: toWidgetLines(content || "(empty file)", 120),
       };
 
       recordEvent(`Checkpoint opened: ${label} (${artifactPath})`, ctx);
-      ctx.ui.notify(`⏸ CHECKPOINT: ${label}`, "info");
+      ctx.ui.notify(`⏸  CHECKPOINT: ${label}`, "info");
 
       ab.writeWorkflowState({
         ...ab.readWorkflowState(),
         status: "waiting-checkpoint",
         pendingCheckpoint: { label, artifactPath },
       });
-      refreshRuntimeUi(ctx);
+      refreshUi(ctx);
 
       return new Promise<CheckpointDecision>((resolve) => {
         pendingCheckpointResolve = resolve;
@@ -462,347 +472,531 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
     };
   }
 
+  async function shortcutReject(ctx: ExtensionContext): Promise<void> {
+    const comment = await ctx.ui.input("Reject checkpoint", "Explain what needs to change");
+    if (!comment?.trim()) return;
+    if (!resolveCheckpoint({ type: "rejected", comment: comment.trim() }, ctx)) {
+      ctx.ui.notify("No pending checkpoint", "warning");
+      return;
+    }
+    recordEvent(`Checkpoint rejected: ${truncate(comment, 120)}`, ctx);
+  }
+
+  async function shortcutMoreAnalysis(ctx: ExtensionContext): Promise<void> {
+    const request = await ctx.ui.input("More analysis", "What do you want to clarify? ");
+    if (!request?.trim()) return;
+    if (!resolveCheckpoint({ type: "more-analysis", request: request.trim() }, ctx)) {
+      ctx.ui.notify("No pending checkpoint", "warning");
+      return;
+    }
+    recordEvent(`More analysis requested: ${truncate(request, 120)}`, ctx);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Pipeline execution helpers
+  // ────────────────────────────────────────────────────────────────────────────
+
+  function runDetached(ctx: ExtensionContext, label: string, fn: () => Promise<void>): void {
+    recordEvent(`${label} queued`, ctx);
+    ctx.ui.notify(`${label} started in background.`, "info");
+    void (async () => {
+      try {
+        await fn();
+      } catch (err) {
+        recordEvent(`${label} crashed: ${String(err)}`, ctx);
+        ctx.ui.notify(`${label} crashed: ${String(err)}`, "error");
+      }
+    })();
+  }
+
+  async function executePipeline(opts: {
+    pipeline: Pipeline;
+    zone: string;
+    objective: string;
+    ctx: ExtensionContext;
+    startIndex: number;
+    resumed: boolean;
+  }): Promise<void> {
+    const { pipeline, zone, objective, ctx, startIndex, resumed } = opts;
+
+    const existing = ab.readWorkflowState();
+    ab.writeWorkflowState({
+      ...existing,
+      status: "running",
+      currentObjective: objective,
+      currentStep: startIndex,
+      totalSteps: pipeline.steps.length,
+      zone,
+      startedAt: existing.startedAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (resumed) {
+      recordSubagentLog(`↻ Resuming pipeline from step ${startIndex + 1}/${pipeline.steps.length}`, ctx);
+    } else {
+      recordSubagentLog(`🚀 Starting pipeline — ${pipeline.steps.length} steps for zone "${zone}"`, ctx);
+    }
+
+    let activeDDRPath: string | undefined = existing.activeDDRPath;
+
+    for (let i = startIndex; i < pipeline.steps.length; i += 1) {
+      const step = pipeline.steps[i];
+
+      ab.writeWorkflowState({
+        ...ab.readWorkflowState(),
+        status: "running",
+        currentStep: i + 1,
+        currentRole: step.role,
+        pendingCheckpoint: undefined,
+        activeDDRPath,
+      });
+
+      recordSubagentLog(`Step ${i + 1}/${pipeline.steps.length}: ${step.role} (${step.mode})`, ctx);
+
+      if (step.role === "act" && step.mode !== "characterization") {
+        // Find last DDR written.
+        activeDDRPath = ab.findLatestDDRPath() ?? ab.paths.decisions.ddr(ab.nextDDRNumber() - 1);
+
+        const ddrContent = ab.readIfExists(activeDDRPath);
+        const meta = parseDdrMeta(ddrContent);
+        step.allowedPaths = meta?.authorizedPaths ?? extractAuthorizedPathsFallback(ddrContent);
+        recordSubagentLog(
+          `Act scope loaded from ${activeDDRPath} (${step.allowedPaths.length} paths)`,
+          ctx,
+        );
+      }
+
+      try {
+        await runStep({
+          step,
+          activeDDRPath: step.role === "act" ? activeDDRPath : undefined,
+          onCheckpoint: makeCheckpointHandler(ctx),
+          onProgress: (msg) => recordSubagentLog(msg, ctx),
+          onTelemetry: (data) => {
+            applyTelemetry(data);
+            refreshUi(ctx);
+          },
+        });
+
+        // After Decide completes, the DDR has been approved at its checkpoint.
+        // Mark it as APPROVED and ensure it is indexed.
+        if (step.role === "decide") {
+          const ddrPath = ab.findLatestDDRPath() ?? ab.paths.decisions.ddr(ab.nextDDRNumber() - 1);
+          activeDDRPath = ddrPath;
+          setDdrStatus(ddrPath, "APPROVED");
+          upsertDdrIndex(ddrPath);
+          recordSubagentLog(`DDR approved: ${ddrPath}`, ctx);
+        }
+
+        ab.writeWorkflowState({
+          ...ab.readWorkflowState(),
+          status: "running",
+          currentStep: i + 1,
+          currentRole: step.role,
+          lastCompletedStep: i + 1,
+          pendingCheckpoint: undefined,
+          activeDDRPath,
+        });
+      } catch (err) {
+        const message = `❌ Step ${step.role} failed: ${String(err)}`;
+        ctx.ui.notify(message, "error");
+        recordSubagentLog(message, ctx);
+        ab.writeWorkflowState({
+          ...ab.readWorkflowState(),
+          status: "failed",
+          currentStep: i + 1,
+          currentRole: step.role,
+          activeDDRPath,
+        });
+        return;
+      }
+    }
+
+    // Deterministic post-cycle updates (health map, debt, index)
+    postCycleUpdate(zone, activeDDRPath);
+    recordSubagentLog(`Post-cycle update applied for zone=${zone}`, ctx);
+
+    ab.writeWorkflowState({
+      status: "idle",
+      updatedAt: new Date().toISOString(),
+    });
+
+    ctx.ui.notify(`✅ Pipeline complete for "${objective}"`, "info");
+    recordEvent(`Pipeline complete: ${objective}`, ctx);
+    refreshUi(ctx);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Actions
+  // ────────────────────────────────────────────────────────────────────────────
+
+  function enableArchUi(ctx: ExtensionContext): void {
+    runtime.archEnabled = true;
+    if (!runtime.ui.visible) runtime.ui.visible = true;
+    refreshUi(ctx);
+  }
+
+  function actionInit(ctx: ExtensionContext): void {
+    enableArchUi(ctx);
+    runDetached(ctx, "arch:init", async () => {
+      const lockOwner = tryAcquireWorkflowLock("arch:init", ctx);
+      if (!lockOwner) return;
+
+      try {
+        const current = ab.readWorkflowState();
+        if (current.status !== "idle") {
+          ctx.ui.notify(`Workflow is ${current.status}.`, "warning");
+          return;
+        }
+
+        const wasInitialized = ab.isInitialized();
+        const repoName = process.cwd().split("/").pop() ?? "unknown";
+        ab.init(repoName);
+
+        ctx.ui.notify(
+          wasInitialized
+            ? "archbase/ already exists. Missing files were created without overriding existing ones."
+            : "✓ archbase/ initialized (non-destructive).",
+          "info",
+        );
+
+        ab.writeWorkflowState({
+          ...ab.readWorkflowState(),
+          status: "running",
+          currentObjective: "Deep bootstrap analysis",
+          currentStep: 1,
+          totalSteps: 1,
+          currentRole: "understand",
+          zone: ".",
+          startedAt: new Date().toISOString(),
+        });
+        refreshUi(ctx);
+
+        await runStep({
+          step: {
+            role: "understand",
+            mode: "deep",
+            zone: ".",
+            objective:
+              "Bootstrap archbase in-depth. Perform a deep architectural analysis of the entire repository. " +
+              "Write/update ARCH.md and zone-level analysis in archbase/. Include forensics artifacts (ARCHAEOLOGY.md and INTENT.md) when uncertainty or legacy signals exist.",
+            requiresCheckpoint: true,
+            checkpointLabel: "Review bootstrap deep analysis (ARCH/forensics)",
+          },
+          onCheckpoint: makeCheckpointHandler(ctx),
+          onProgress: (msg) => recordSubagentLog(`bootstrap: ${msg}`, ctx),
+          onTelemetry: (data) => {
+            applyTelemetry(data);
+            refreshUi(ctx);
+          },
+        });
+
+        ab.writeWorkflowState({ status: "idle", updatedAt: new Date().toISOString() });
+        recordEvent("Bootstrap analysis completed", ctx);
+      } catch (err) {
+        ab.writeWorkflowState({ ...ab.readWorkflowState(), status: "failed" });
+        recordEvent(`Bootstrap failed: ${String(err)}`, ctx);
+        ctx.ui.notify(`❌ Bootstrap analysis failed: ${String(err)}`, "error");
+      } finally {
+        releaseWorkflowLock(lockOwner, ctx);
+      }
+    });
+  }
+
+  function actionTask(zone: string, objective: string, ctx: ExtensionContext): void {
+    enableArchUi(ctx);
+    runDetached(ctx, "arch:task", async () => {
+      if (!ab.isInitialized()) {
+        const repoName = process.cwd().split("/").pop() ?? "unknown";
+        ab.init(repoName);
+        ctx.ui.notify("archbase/ initialized (non-destructive)", "info");
+      }
+
+      const lockOwner = tryAcquireWorkflowLock("arch:task", ctx);
+      if (!lockOwner) return;
+
+      try {
+        const existing = ab.readWorkflowState();
+        if (existing.status !== "idle") {
+          ctx.ui.notify(`Workflow is ${existing.status}.`, "warning");
+          return;
+        }
+
+        recordEvent(`Task requested: zone=${zone} objective=${objective}`, ctx);
+
+        const pipeline = configurePipeline(zone, objective);
+        await executePipeline({ pipeline, zone, objective, ctx, startIndex: 0, resumed: false });
+      } finally {
+        releaseWorkflowLock(lockOwner, ctx);
+      }
+    });
+  }
+
+  function actionResume(ctx: ExtensionContext): void {
+    enableArchUi(ctx);
+    runDetached(ctx, "arch:resume", async () => {
+      if (!ab.isInitialized()) {
+        const repoName = process.cwd().split("/").pop() ?? "unknown";
+        ab.init(repoName);
+        ctx.ui.notify("archbase/ initialized (non-destructive)", "info");
+      }
+
+      const lockOwner = tryAcquireWorkflowLock("arch:resume", ctx);
+      if (!lockOwner) return;
+
+      try {
+        const state = ab.readWorkflowState();
+        if (state.status === "idle") {
+          ctx.ui.notify("No interrupted workflow to resume", "info");
+          return;
+        }
+        if (!state.zone || !state.currentObjective) {
+          ctx.ui.notify("Cannot resume: missing zone/objective", "error");
+          return;
+        }
+
+        const pipeline = configurePipeline(state.zone, state.currentObjective);
+        const stepNumber = state.currentStep ?? (state.lastCompletedStep ? state.lastCompletedStep + 1 : 1);
+        const startIndex = Math.max(stepNumber - 1, 0);
+
+        await executePipeline({
+          pipeline,
+          zone: state.zone,
+          objective: state.currentObjective,
+          ctx,
+          startIndex,
+          resumed: true,
+        });
+      } finally {
+        releaseWorkflowLock(lockOwner, ctx);
+      }
+    });
+  }
+
+  function actionAbort(ctx: ExtensionContext): void {
+    pendingCheckpointResolve = null;
+    runtime.checkpointView = undefined;
+    resetSubagent();
+
+    ab.writeWorkflowState({ status: "idle", updatedAt: new Date().toISOString() });
+    forceReleaseWorkflowLock(ctx);
+    recordEvent("Workflow aborted", ctx);
+    ctx.ui.notify("Workflow aborted and reset to idle", "warning");
+    refreshUi(ctx);
+  }
+
+  function actionReview(zone: string, ctx: ExtensionContext): void {
+    enableArchUi(ctx);
+    runDetached(ctx, "arch:review", async () => {
+      if (!ab.isInitialized()) {
+        const repoName = process.cwd().split("/").pop() ?? "unknown";
+        ab.init(repoName);
+        ctx.ui.notify("archbase/ initialized (non-destructive)", "info");
+      }
+
+      const lockOwner = tryAcquireWorkflowLock("arch:review", ctx);
+      if (!lockOwner) return;
+
+      try {
+        recordEvent(`Standalone review started for zone=${zone}`, ctx);
+        refreshUi(ctx);
+
+        await runStep({
+          step: {
+            role: "verify",
+            mode: "standard",
+            zone,
+            objective: `Standalone architecture review of zone \"${zone}\"`,
+            requiresCheckpoint: true,
+            checkpointLabel: "Review Audit Report",
+          },
+          onCheckpoint: makeCheckpointHandler(ctx),
+          onProgress: (msg) => recordSubagentLog(`review: ${msg}`, ctx),
+          onTelemetry: (data) => {
+            applyTelemetry(data);
+            refreshUi(ctx);
+          },
+        });
+
+        postCycleUpdate(zone);
+        recordSubagentLog(`Post-cycle update applied for zone=${zone} (standalone review)`, ctx);
+        recordEvent("Standalone review completed", ctx);
+      } finally {
+        releaseWorkflowLock(lockOwner, ctx);
+      }
+    });
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Director conversation: intercept normal input (no commands)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  pi.on("input", async (event, ctx) => {
+    // Let slash commands pass through.
+    if (event.text.trim().startsWith("/")) return { action: "continue" };
+
+    // Director mode is opt-in. When disabled, Pi behaves normally.
+    if (!runtime.directorEnabled) return { action: "continue" };
+
+    // Show the Director prompt in history, then the director reply.
+    pi.sendMessage({
+      customType: "archagent-director-user",
+      content: event.text,
+      display: true,
+    });
+
+    try {
+      const response = await director.interpret(event.text, ctx);
+      sendDirectorMessage(pi, response.reply);
+      await executeDirectorAction(response.action, ctx);
+    } catch (err) {
+      ctx.ui.notify(`Director interface error: ${String(err)}`, "error");
+    }
+
+    refreshUi(ctx);
+    return { action: "handled" };
+  });
+
+  async function executeDirectorAction(action: DirectorAction, ctx: ExtensionContext): Promise<void> {
+    switch (action.type) {
+      case "help":
+        sendDirectorMessage(
+          pi,
+          "You can describe what you want (e.g. 'Add OAuth to src/auth'). I will run the pipeline and present checkpoints. Shortcuts: Alt+U (UI), Alt+L (logs), Alt+O (full logs).",
+        );
+        return;
+      case "none":
+        return;
+      case "init":
+        actionInit(ctx);
+        return;
+      case "task":
+        actionTask(action.zone, action.objective, ctx);
+        return;
+      case "review":
+        actionReview(action.zone, ctx);
+        return;
+      case "status":
+        ctx.ui.notify(
+          `Workflow: ${ab.readWorkflowState().status} | Agent: ${ab.readWorkflowState().currentRole ?? "-"}`,
+          "info",
+        );
+        return;
+      case "resume":
+        actionResume(ctx);
+        return;
+      case "abort":
+        actionAbort(ctx);
+        return;
+      case "approve":
+        if (!resolveCheckpoint({ type: "approved" }, ctx)) ctx.ui.notify("No pending checkpoint", "warning");
+        return;
+      case "reject":
+        if (!action.comment?.trim()) {
+          await shortcutReject(ctx);
+          return;
+        }
+        if (!resolveCheckpoint({ type: "rejected", comment: action.comment.trim() }, ctx)) {
+          ctx.ui.notify("No pending checkpoint", "warning");
+        }
+        return;
+      case "more-analysis":
+        if (!action.request?.trim()) {
+          await shortcutMoreAnalysis(ctx);
+          return;
+        }
+        if (!resolveCheckpoint({ type: "more-analysis", request: action.request.trim() }, ctx)) {
+          ctx.ui.notify("No pending checkpoint", "warning");
+        }
+        return;
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Commands (fallback / scripting surface)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  pi.registerCommand("arch:director", {
+    description: "Enable/disable ArchAgent Director (conversational) mode",
+    handler: async (args, ctx) => {
+      const a = args.trim().toLowerCase();
+      const enable = a ? a === "on" || a === "enable" || a === "1" || a === "true" : !runtime.directorEnabled;
+
+      runtime.archEnabled = enable;
+      runtime.directorEnabled = enable;
+      runtime.ui.visible = enable;
+
+      ctx.ui.notify(enable ? "ArchAgent Director enabled" : "ArchAgent Director disabled", "info");
+      refreshUi(ctx);
+    },
+  });
+
   pi.registerCommand("arch:init", {
     description: "Initialize archbase/ (non-destructive) and run deep bootstrap analysis",
-    handler: async (_args, ctx) => {
-      runDetached(ctx, "arch:init", async () => {
-        const lockOwner = tryAcquireWorkflowLock("arch:init", ctx);
-        if (!lockOwner) return;
-
-        try {
-          const current = ab.readWorkflowState();
-          if (current.status !== "idle") {
-            ctx.ui.notify(
-              `Workflow is ${current.status}. Use /arch:resume to continue or /arch:abort to reset.`,
-              "warning",
-            );
-            return;
-          }
-
-          const wasInitialized = ab.isInitialized();
-          const repoName = process.cwd().split("/").pop() ?? "unknown";
-          ab.init(repoName);
-
-          if (wasInitialized) {
-            ctx.ui.notify(
-              "archbase/ already exists. Missing files were created without overriding existing ones.",
-              "info",
-            );
-            recordEvent("arch:init non-destructive sync (existing archbase)", ctx);
-          } else {
-            ctx.ui.notify("✓ archbase/ initialized (non-destructive).", "info");
-            recordEvent("arch:init created base structure", ctx);
-          }
-
-          ab.writeWorkflowState({
-            ...ab.readWorkflowState(),
-            status: "running",
-            currentObjective: "Deep bootstrap analysis",
-            currentStep: 1,
-            totalSteps: 1,
-            currentRole: "understand",
-            zone: ".",
-            startedAt: new Date().toISOString(),
-          });
-          refreshRuntimeUi(ctx);
-
-          await runStep({
-            step: {
-              role: "understand",
-              mode: "deep",
-              zone: ".",
-              objective:
-                "Bootstrap archbase in-depth. Perform a deep architectural analysis of the entire repository. " +
-                "Write/update ARCH.md and zone-level analysis in archbase/. Include forensics artifacts (ARCHAEOLOGY.md and INTENT.md) when uncertainty or legacy signals exist.",
-              requiresCheckpoint: true,
-              checkpointLabel: "Review bootstrap deep analysis (ARCH/forensics)",
-            },
-            onCheckpoint: makeCheckpointHandler(ctx),
-            onProgress: (msg) => {
-              recordSubagentLog(`bootstrap: ${msg}`, ctx);
-            },
-            onTelemetry: (data) => {
-              applyTelemetry(data);
-              refreshRuntimeUi(ctx);
-            },
-          });
-
-          ab.writeWorkflowState({
-            status: "idle",
-            updatedAt: new Date().toISOString(),
-          });
-
-          recordEvent("Bootstrap analysis completed", ctx);
-          ctx.ui.notify("✅ Bootstrap analysis complete. Review ARCH.md, then refine CONSTRAINTS.md and CONVENTIONS.md.", "info");
-        } catch (err) {
-          ab.writeWorkflowState({
-            ...ab.readWorkflowState(),
-            status: "failed",
-          });
-          recordEvent(`Bootstrap failed: ${String(err)}`, ctx);
-          ctx.ui.notify(`❌ Bootstrap analysis failed: ${String(err)}`, "error");
-        } finally {
-          releaseWorkflowLock(lockOwner, ctx);
-        }
-      });
-    },
+    handler: async (_args, ctx) => actionInit(ctx),
   });
 
   pi.registerCommand("arch:task", {
     description: "Launch full agent pipeline. Usage: /arch:task <zone> | <objective>",
     handler: async (args, ctx) => {
-      runDetached(ctx, "arch:task", async () => {
-        if (!ab.isInitialized()) {
-          ctx.ui.notify("Run /arch:init first", "error");
-          return;
-        }
-
-        const lockOwner = tryAcquireWorkflowLock("arch:task", ctx);
-        if (!lockOwner) return;
-
-        try {
-          const existing = ab.readWorkflowState();
-          if (existing.status !== "idle") {
-            ctx.ui.notify(
-              `Workflow is ${existing.status}. Use /arch:resume to continue or /arch:abort to reset.`,
-              "warning",
-            );
-            return;
-          }
-
-          const [zone, ...objectiveParts] = args.split("|");
-          const objective = objectiveParts.join("|").trim();
-
-          if (!zone?.trim() || !objective) {
-            ctx.ui.notify("Usage: /arch:task <zone> | <objective>", "error");
-            return;
-          }
-
-          recordEvent(`Task requested: zone=${zone.trim()} objective=${objective}`, ctx);
-
-          const pipeline = configurePipeline(zone.trim(), objective);
-          await executePipeline({
-            pipeline,
-            zone: zone.trim(),
-            objective,
-            ctx,
-            onCheckpoint: makeCheckpointHandler(ctx),
-            startIndex: 0,
-            resumed: false,
-            onEvent: (message) => recordSubagentLog(message, ctx),
-            onTelemetry: (data) => {
-              applyTelemetry(data);
-              refreshRuntimeUi(ctx);
-            },
-          });
-        } finally {
-          releaseWorkflowLock(lockOwner, ctx);
-        }
-      });
-    },
-  });
-
-  pi.registerCommand("arch:resume", {
-    description: "Resume interrupted workflow from current step",
-    handler: async (_args, ctx) => {
-      runDetached(ctx, "arch:resume", async () => {
-        if (!ab.isInitialized()) {
-          ctx.ui.notify("Run /arch:init first", "error");
-          return;
-        }
-
-        const lockOwner = tryAcquireWorkflowLock("arch:resume", ctx);
-        if (!lockOwner) return;
-
-        try {
-          const state = ab.readWorkflowState();
-          if (state.status === "idle") {
-            ctx.ui.notify("No interrupted workflow to resume", "info");
-            return;
-          }
-
-          if (!state.zone || !state.currentObjective) {
-            ctx.ui.notify("Cannot resume: missing zone/objective in WORKFLOW_STATE", "error");
-            return;
-          }
-
-          recordEvent(`Resuming workflow from status=${state.status}`, ctx);
-
-          const pipeline = configurePipeline(state.zone, state.currentObjective);
-          const stepNumber = state.currentStep ?? (state.lastCompletedStep ? state.lastCompletedStep + 1 : 1);
-          const startIndex = Math.max(stepNumber - 1, 0);
-
-          await executePipeline({
-            pipeline,
-            zone: state.zone,
-            objective: state.currentObjective,
-            ctx,
-            onCheckpoint: makeCheckpointHandler(ctx),
-            startIndex,
-            resumed: true,
-            onEvent: (message) => recordSubagentLog(message, ctx),
-            onTelemetry: (data) => {
-              applyTelemetry(data);
-              refreshRuntimeUi(ctx);
-            },
-          });
-        } finally {
-          releaseWorkflowLock(lockOwner, ctx);
-        }
-      });
-    },
-  });
-
-  pi.registerCommand("arch:abort", {
-    description: "Abort current workflow and reset to idle",
-    handler: async (_args, ctx) => {
-      const state = ab.readWorkflowState();
-      
-      pendingCheckpointResolve = null;
-      runtime.checkpointView = undefined;
-      resetSubagent();
-      
-      ab.writeWorkflowState({
-        status: "idle",
-        updatedAt: new Date().toISOString(),
-      });
-      forceReleaseWorkflowLock(ctx);
-      recordEvent("Workflow aborted by Director", ctx);
-      ctx.ui.notify("Workflow aborted and reset to idle", "warning");
-      refreshRuntimeUi(ctx);
+      const [zone, ...objectiveParts] = args.split("|");
+      const objective = objectiveParts.join("|").trim();
+      if (!zone?.trim() || !objective) {
+        ctx.ui.notify("Usage: /arch:task <zone> | <objective>", "error");
+        return;
+      }
+      actionTask(zone.trim(), objective, ctx);
     },
   });
 
   pi.registerCommand("arch:review", {
     description: "Run standalone Verify audit on a zone",
-    handler: async (args, ctx) => {
-      runDetached(ctx, "arch:review", async () => {
-        if (!ab.isInitialized()) {
-          ctx.ui.notify("Run /arch:init first", "error");
-          return;
-        }
-
-        const lockOwner = tryAcquireWorkflowLock("arch:review", ctx);
-        if (!lockOwner) return;
-
-        try {
-          const zone = args.trim() || ".";
-          recordEvent(`Standalone review started for zone=${zone}`, ctx);
-          refreshRuntimeUi(ctx);
-
-          await runStep({
-            step: {
-              role: "verify",
-              mode: "standard",
-              zone,
-              objective: `Standalone architecture review of zone "${zone}"`,
-              requiresCheckpoint: true,
-              checkpointLabel: "Review Audit Report",
-            },
-            onCheckpoint: makeCheckpointHandler(ctx),
-            onProgress: (msg) => {
-              recordSubagentLog(`review: ${msg}`, ctx);
-            },
-            onTelemetry: (data) => {
-              applyTelemetry(data);
-              refreshRuntimeUi(ctx);
-            },
-          });
-
-          recordEvent("Standalone review completed", ctx);
-        } finally {
-          releaseWorkflowLock(lockOwner, ctx);
-        }
-      });
-    },
+    handler: async (args, ctx) => actionReview(args.trim() || ".", ctx),
   });
 
-  pi.registerCommand("arch:verbose", {
-    description: "Toggle runtime verbosity. Usage: /arch:verbose on|off",
-    handler: async (args, ctx) => {
-      const value = args.trim().toLowerCase();
-      if (!value || (value !== "on" && value !== "off")) {
-        ctx.ui.notify(`Verbose is currently ${runtime.verbose ? "ON" : "OFF"}. Usage: /arch:verbose on|off`, "info");
-        return;
-      }
+  pi.registerCommand("arch:resume", {
+    description: "Resume interrupted workflow from current step",
+    handler: async (_args, ctx) => actionResume(ctx),
+  });
 
-      runtime.verbose = value === "on";
-      ctx.ui.notify(`Verbose mode: ${runtime.verbose ? "ON" : "OFF"}`, "info");
-      refreshRuntimeUi(ctx);
+  pi.registerCommand("arch:abort", {
+    description: "Abort current workflow and reset to idle",
+    handler: async (_args, ctx) => actionAbort(ctx),
+  });
+
+  // Legacy aliases (older docs / muscle memory)
+  pi.registerCommand("arch:logs-mode", {
+    description: "Legacy alias. Use Alt+O to toggle full logs.",
+    handler: async (_args, ctx) => {
+      runtime.logsExpanded = !runtime.logsExpanded;
+      refreshUi(ctx);
     },
   });
 
   pi.registerCommand("arch:view", {
-    description: "Set runtime widget density. Usage: /arch:view compact|expanded",
-    handler: async (args, ctx) => {
-      const value = args.trim().toLowerCase();
-      if (!value || (value !== "compact" && value !== "expanded")) {
-        ctx.ui.notify(`Current view is ${runtime.viewMode}. Usage: /arch:view compact|expanded`, "info");
-        return;
-      }
-
-      runtime.viewMode = value;
-      ctx.ui.notify(`View mode: ${runtime.viewMode}`, "info");
-      refreshRuntimeUi(ctx);
-    },
-  });
-
-  pi.registerCommand("arch:logs", {
-    description: "Refresh flow widget with current log mode",
+    description: "Legacy alias. Use Alt+V to toggle view density.",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(`Flow log refreshed (${runtime.logsExpanded ? "FULL" : "SUMMARY"})`, "info");
-      refreshRuntimeUi(ctx);
-    },
-  });
-
-  pi.registerCommand("arch:logs-mode", {
-    description: "Toggle flow log mode. Usage: /arch:logs-mode full|summary",
-    handler: async (args, ctx) => {
-      const value = args.trim().toLowerCase();
-      if (!value || (value !== "full" && value !== "summary")) {
-        ctx.ui.notify(`Current logs mode is ${runtime.logsExpanded ? "full" : "summary"}. Usage: /arch:logs-mode full|summary`, "info");
-        return;
-      }
-
-      runtime.logsExpanded = value === "full";
-      ctx.ui.notify(`Logs mode: ${runtime.logsExpanded ? "FULL" : "SUMMARY"}`, "info");
-      refreshRuntimeUi(ctx);
-    },
-  });
-
-  pi.registerShortcut(Key.ctrlShift("o"), {
-    description: "Toggle full logs panel",
-    handler: async (ctx) => {
-      runtime.logsExpanded = !runtime.logsExpanded;
-      ctx.ui.notify(`Logs panel: ${runtime.logsExpanded ? "FULL" : "SUMMARY"}`, "info");
-      refreshRuntimeUi(ctx);
+      runtime.viewMode = runtime.viewMode === "compact" ? "expanded" : "compact";
+      refreshUi(ctx);
     },
   });
 
   pi.registerCommand("arch:status", {
     description: "Show workflow state summary",
     handler: async (_args, ctx) => {
-      const state = ab.readWorkflowState();
-      ctx.ui.notify(`Workflow: ${state.status} | Agent: ${state.currentRole ?? "idle"} | Objective: ${truncate(state.currentObjective ?? "none", 60)}`, "info");
-      refreshRuntimeUi(ctx);
+      const s = ab.readWorkflowState();
+      ctx.ui.notify(
+        `Workflow: ${s.status} | Role: ${s.currentRole ?? "-"} | Zone: ${s.zone ?? "-"} | Objective: ${truncate(s.currentObjective ?? "-", 80)}`,
+        "info",
+      );
+      refreshUi(ctx);
     },
   });
 
   pi.registerCommand("arch:approve", {
-    description: "Approve the pending checkpoint",
+    description: "Approve pending checkpoint",
     handler: async (_args, ctx) => {
-      if (!resolveCheckpoint({ type: "approved" }, ctx)) {
-        const state = ab.readWorkflowState();
-        if (state.status === "waiting-checkpoint") {
-          ctx.ui.notify("Checkpoint session was interrupted. Use /arch:resume to recreate it.", "warning");
-          return;
-        }
-        ctx.ui.notify("No pending checkpoint in this session", "warning");
-        return;
-      }
-
-      recordEvent("Checkpoint approved", ctx);
-      ctx.ui.notify("✓ Checkpoint approved — pipeline continuing", "info");
+      if (!resolveCheckpoint({ type: "approved" }, ctx)) ctx.ui.notify("No pending checkpoint", "warning");
     },
   });
 
@@ -811,40 +1005,10 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       const comment = args.trim();
       if (!comment) {
-        ctx.ui.notify("Provide feedback: /arch:reject <comment>", "error");
+        await shortcutReject(ctx);
         return;
       }
-
-      if (!resolveCheckpoint({ type: "rejected", comment }, ctx)) {
-        const state = ab.readWorkflowState();
-        if (state.status === "waiting-checkpoint") {
-          ctx.ui.notify("Checkpoint session was interrupted. Use /arch:resume to recreate it.", "warning");
-        } else {
-          ctx.ui.notify("No pending checkpoint in this session", "warning");
-        }
-        return;
-      }
-
-      recordEvent(`Checkpoint rejected: ${truncate(comment, 120)}`, ctx);
-
-      const add = await ctx.ui.confirm(
-        "Add to CONSTRAINTS.md?",
-        `"${comment}"\n\nThis feedback seems like a project constraint. Add it permanently?`,
-      );
-
-      if (add) {
-        const existing = ab.readIfExists(ab.paths.knowledge.constraints);
-        const date = new Date().toISOString().split("T")[0];
-        ab.write(
-          ab.paths.knowledge.constraints,
-          `${existing}\n\n## [${date}] Inferred from DDR rejection\n${comment}\n`,
-        );
-        ab.refreshAgentsMd();
-        ctx.ui.notify("✓ Added to CONSTRAINTS.md", "info");
-        recordEvent("Constraint inferred and added from rejection feedback", ctx);
-      }
-
-      ctx.ui.notify("✗ Checkpoint rejected — agent will revise", "info");
+      if (!resolveCheckpoint({ type: "rejected", comment }, ctx)) ctx.ui.notify("No pending checkpoint", "warning");
     },
   });
 
@@ -853,34 +1017,119 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
-        ctx.ui.notify("Usage: /arch:more-analysis <request>", "error");
+        await shortcutMoreAnalysis(ctx);
         return;
       }
-
-      if (!resolveCheckpoint({ type: "more-analysis", request }, ctx)) {
-        const state = ab.readWorkflowState();
-        if (state.status === "waiting-checkpoint") {
-          ctx.ui.notify("Checkpoint session was interrupted. Use /arch:resume to recreate it.", "warning");
-        } else {
-          ctx.ui.notify("No pending checkpoint in this session", "warning");
-        }
-        return;
-      }
-
-      recordEvent(`More analysis requested: ${truncate(request, 120)}`, ctx);
-      ctx.ui.notify("ℹ Requested more analysis — pipeline continuing", "info");
+      if (!resolveCheckpoint({ type: "more-analysis", request }, ctx)) ctx.ui.notify("No pending checkpoint", "warning");
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
-    const s = ab.readWorkflowState();
-    if (s.status === "idle") resetSubagent();
-    recordEvent(`Session started (workflow=${s.status})`, ctx);
-    refreshRuntimeUi(ctx);
+  // ────────────────────────────────────────────────────────────────────────────
+  // Shortcuts (primary UX)
+  // ────────────────────────────────────────────────────────────────────────────
 
-    if (s.status !== "idle") {
-      ctx.ui.notify(buildRecoveryHint(s), "warning");
-    }
+  // IMPORTANT: many terminals do not distinguish Ctrl+Shift+<letter> from Ctrl+<letter>.
+  // Use Alt-based shortcuts for reliability.
+
+  function requireArchEnabled(ctx: ExtensionContext): boolean {
+    if (runtime.archEnabled) return true;
+    ctx.ui.notify("ArchAgent is disabled. Run /arch:director to enable.", "info");
+    return false;
+  }
+
+  pi.registerShortcut("alt+u", {
+    description: "Toggle ArchAgent UI panels",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      runtime.ui.visible = !runtime.ui.visible;
+      refreshUi(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+l", {
+    description: "Toggle logs panel visibility",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      runtime.ui.showLogs = !runtime.ui.showLogs;
+      refreshUi(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+s", {
+    description: "Toggle status panel visibility",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      runtime.ui.showStatus = !runtime.ui.showStatus;
+      refreshUi(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+o", {
+    description: "Toggle full logs (summary/full)",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      runtime.logsExpanded = !runtime.logsExpanded;
+      refreshUi(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+v", {
+    description: "Toggle view density (compact/expanded)",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      runtime.viewMode = runtime.viewMode === "compact" ? "expanded" : "compact";
+      refreshUi(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+y", {
+    description: "Approve checkpoint (if any)",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      if (!resolveCheckpoint({ type: "approved" }, ctx)) ctx.ui.notify("No pending checkpoint", "warning");
+    },
+  });
+
+  pi.registerShortcut("alt+n", {
+    description: "Reject checkpoint (prompt for feedback)",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      await shortcutReject(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+m", {
+    description: "Request more analysis (prompt)",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      await shortcutMoreAnalysis(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+x", {
+    description: "Abort workflow",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      actionAbort(ctx);
+    },
+  });
+
+  pi.registerShortcut("alt+r", {
+    description: "Resume workflow",
+    handler: async (ctx) => {
+      if (!requireArchEnabled(ctx)) return;
+      actionResume(ctx);
+    },
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Session lifecycle
+  // ────────────────────────────────────────────────────────────────────────────
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (ab.readWorkflowState().status === "idle") resetSubagent();
+    recordEvent("Session started", ctx);
+    refreshUi(ctx);
 
     if (ab.exists(ab.paths.workflow.lock)) {
       ctx.ui.notify(`Workflow lock detected: ${readLockSummary()}`, "warning");
@@ -888,132 +1137,41 @@ export default function archagentOrchestrator(pi: ExtensionAPI): void {
   });
 }
 
-interface ExecutePipelineOptions {
-  pipeline: Pipeline;
-  zone: string;
-  objective: string;
-  ctx: ExtensionCommandContext;
-  onCheckpoint: (label: string, artifactPath: string) => Promise<CheckpointDecision>;
-  startIndex: number;
-  resumed: boolean;
-  onEvent: (message: string) => void;
-  onTelemetry?: (data: StepTelemetry) => void;
-}
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────────
 
-async function executePipeline(opts: ExecutePipelineOptions): Promise<void> {
-  const { pipeline, zone, objective, ctx, onCheckpoint, startIndex, resumed, onEvent, onTelemetry } = opts;
-
-  const existing = ab.readWorkflowState();
-  ab.writeWorkflowState({
-    ...existing,
-    status: "running",
-    currentObjective: objective,
-    currentStep: startIndex,
-    totalSteps: pipeline.steps.length,
-    zone,
-    startedAt: existing.startedAt ?? new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+function sendDirectorMessage(pi: ExtensionAPI, text: string): void {
+  pi.sendMessage({
+    customType: "archagent-director",
+    content: text,
+    display: true,
   });
-
-  if (resumed) {
-    const msg = `↻ Resuming pipeline from step ${startIndex + 1}/${pipeline.steps.length}. Current step will be re-executed.`;
-    ctx.ui.notify(msg, "warning");
-    onEvent(msg);
-  } else {
-    const msg = `🚀 Starting pipeline — ${pipeline.steps.length} steps for zone "${zone}"`;
-    ctx.ui.notify(msg, "info");
-    onEvent(msg);
-  }
-
-  let activeDDRPath: string | undefined = existing.activeDDRPath;
-
-  for (let i = startIndex; i < pipeline.steps.length; i += 1) {
-    const step = pipeline.steps[i];
-
-    ab.writeWorkflowState({
-      ...ab.readWorkflowState(),
-      status: "running",
-      currentStep: i + 1,
-      currentRole: step.role,
-      pendingCheckpoint: undefined,
-      activeDDRPath,
-    });
-
-    onEvent(`Step ${i + 1}/${pipeline.steps.length}: ${step.role}`);
-
-    if (step.role === "act" && step.mode !== "characterization") {
-      const n = ab.nextDDRNumber() - 1;
-      activeDDRPath = ab.paths.decisions.ddr(n);
-      step.allowedPaths = extractAuthorizedPathsFromDDR(activeDDRPath);
-      onEvent(`Act authorized scope loaded from ${activeDDRPath} (${step.allowedPaths.length} paths)`);
-    }
-
-    try {
-      await runStep({
-        step,
-        activeDDRPath: step.role === "act" ? activeDDRPath : undefined,
-        onCheckpoint,
-        onProgress: (msg) => {
-          onEvent(msg);
-        },
-        onTelemetry,
-      });
-
-      ab.writeWorkflowState({
-        ...ab.readWorkflowState(),
-        status: "running",
-        currentStep: i + 1,
-        currentRole: step.role,
-        lastCompletedStep: i + 1,
-        pendingCheckpoint: undefined,
-        activeDDRPath,
-      });
-    } catch (err) {
-      const message = `❌ Step ${step.role} failed: ${String(err)}`;
-      ctx.ui.notify(message, "error");
-      onEvent(message);
-      ab.writeWorkflowState({
-        ...ab.readWorkflowState(),
-        status: "failed",
-        currentStep: i + 1,
-        currentRole: step.role,
-        activeDDRPath,
-      });
-      return;
-    }
-  }
-
-  if (activeDDRPath) {
-    postCycleUpdate(zone, activeDDRPath);
-    onEvent(`Post-cycle update applied for zone=${zone}`);
-  }
-
-  ab.writeWorkflowState({
-    status: "idle",
-    updatedAt: new Date().toISOString(),
-  });
-
-  const done = `✅ Pipeline complete for "${objective}"`;
-  ctx.ui.notify(done, "info");
-  onEvent(done);
 }
 
-function worstDimension(dims: Record<string, { status: string }>): string {
-  const statuses = Object.values(dims).map((d) => d.status);
-  if (statuses.includes("compromised")) return "⚠ compromised";
-  if (statuses.includes("attention")) return "~ attention";
-  return "✓ healthy";
-}
+function extractAuthorizedPathsFallback(ddrContent: string): string[] {
+  // Legacy section "Authorized Files"
+  const match = ddrContent.match(/#{2,3}\s*Authorized Files\s*\n([\s\S]*?)(?=\n#{2,3}\s|$)/);
+  if (match) {
+    return match[1]
+      .split("\n")
+      .map((l) => l.replace(/^[-*]\s*/, "").trim())
+      .filter((l) => l.length > 0 && !l.startsWith("#"));
+  }
 
-function extractAuthorizedPathsFromDDR(ddrPath: string): string[] {
-  const content = ab.readIfExists(ddrPath);
-  const match = content.match(/#{2,3}\s*Authorized Files\s*\n([\s\S]*?)(?=\n#{2,3}\s|$)/);
-  if (!match) return [];
+  // Infer from AFFECTED FILES (exact paths)
+  const affected = ddrContent.match(/AFFECTED FILES:\s*\n([\s\S]*?)(?=\n[A-Z _-]+:\s*\n|\n#{2,}|$)/i);
+  if (affected) {
+    return affected[1]
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => l.replace(/:.*/, ""))
+      .map((l) => l.replace(/^[-*]\s*/, "").trim())
+      .filter((p) => p.includes("/"));
+  }
 
-  return match[1]
-    .split("\n")
-    .map((l) => l.replace(/^[-*]\s*/, "").trim())
-    .filter((l) => l.length > 0 && !l.startsWith("#"));
+  return [];
 }
 
 function summarizeArtifact(artifactPath: string, content: string): string {
@@ -1032,19 +1190,6 @@ function summarizeArtifact(artifactPath: string, content: string): string {
   ];
 
   return summaryLines.join("\n");
-}
-
-function buildRecoveryHint(state: WorkflowState): string {
-  if (state.status === "waiting-checkpoint") {
-    return "Recovery available: workflow is waiting-checkpoint. Use /arch:resume to recreate the step/checkpoint, or /arch:abort to reset.";
-  }
-  if (state.status === "running") {
-    return "Recovery available: workflow is running/interrupted. Use /arch:resume to continue from current step, or /arch:abort to reset.";
-  }
-  if (state.status === "failed") {
-    return "Recovery available: workflow is failed. Use /arch:resume to retry current step, or /arch:abort to reset.";
-  }
-  return "Recovery available: use /arch:resume or /arch:abort.";
 }
 
 function readLockSummary(): string {
@@ -1075,4 +1220,90 @@ function toWidgetLines(text: string, maxLines: number): string[] {
   const lines = text.split("\n");
   if (lines.length <= maxLines) return lines;
   return [...lines.slice(0, maxLines), `… (${lines.length - maxLines} more lines truncated)`];
+}
+
+function extractCustomMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => {
+        if (c && typeof c === "object" && "type" in c && (c as any).type === "text") return String((c as any).text ?? "");
+        return "";
+      })
+      .join("");
+  }
+  return String(content ?? "");
+}
+
+function formatLogLine(raw: string, theme: any, full: boolean, viewMode: RuntimeViewMode): string {
+  // Expect: [ISO] message
+  const m = raw.match(/^\[(.*?)\]\s*(.*)$/);
+  const ts = m?.[1] ?? "";
+  const msg = m?.[2] ?? raw;
+
+  const time = ts ? formatLocalTime(ts) : "";
+  const timePart = time ? theme.fg("dim", `[${time}]`) + " " : "";
+
+  const low = msg.toLowerCase();
+
+  let tone: "accent" | "warning" | "error" | "success" | "dim" = "dim";
+  let icon = "○";
+
+  if (low.includes("failed") || low.includes("error") || low.includes("crashed")) {
+    tone = "error";
+    icon = "✖";
+  } else if (low.includes("checkpoint") || low.includes("waiting-checkpoint")) {
+    tone = "warning";
+    icon = "⏸";
+  } else if (low.includes("completed") || low.includes("pipeline complete") || low.includes("post-cycle")) {
+    tone = "success";
+    icon = "✓";
+  } else if (low.startsWith("step ") || low.includes("starting") || low.includes("resuming")) {
+    tone = "accent";
+    icon = "▶";
+  } else if (low.includes("→") || msg.trim().startsWith("→") || msg.trim().startsWith("  →")) {
+    tone = "accent";
+    icon = "→";
+  }
+
+  // Color only the icon + known headers (e.g. [assistant]/[thinking]).
+  // Keep the body text in normal widget text color.
+  let header = "";
+  let rest = msg;
+
+  const headerMatch = msg.match(/^(\[(assistant|thinking)\])\s*(.*)$/i);
+  if (headerMatch) {
+    header = headerMatch[1] ?? "";
+    rest = headerMatch[3] ?? "";
+
+    if (header.toLowerCase() === "[assistant]") {
+      tone = "accent";
+      icon = "✎";
+    } else if (header.toLowerCase() === "[thinking]") {
+      tone = "warning";
+      icon = "🧠";
+    }
+  }
+
+  const iconPart = theme.fg(tone, icon);
+  const headerPart = header ? theme.fg(tone, header) + " " : "";
+  const restPart = theme.fg("customMessageText", rest || "");
+
+  const line = `${timePart}${iconPart} ${headerPart}${restPart}`.trimEnd();
+
+  if (full) return line;
+
+  // SUMMARY mode: keep it dense.
+  const max = viewMode === "compact" ? 200 : 320;
+  return truncateToWidth(line, max);
+}
+
+function formatLocalTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }

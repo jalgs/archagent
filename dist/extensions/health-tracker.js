@@ -35,20 +35,23 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.default = healthTracker;
 const ab = __importStar(require("../orchestrator/archbase"));
-const health_map_1 = require("../orchestrator/health-map");
+/**
+ * NOTE: Health Map updates are handled deterministically by the Orchestrator
+ * in postCycleUpdate().
+ *
+ * This extension is kept as a lightweight signal only.
+ */
 function healthTracker(pi) {
     const role = process.env.ARCHAGENT_ROLE;
     if (role !== "verify")
         return;
     pi.on("agent_end", async (_event, ctx) => {
         const state = ab.readWorkflowState();
-        const zone = state.zone;
-        if (!zone)
+        if (!state.zone)
             return;
         const auditReport = ab.readAuditReport();
         if (!auditReport.trim())
             return;
-        (0, health_map_1.updateZoneFromAuditReport)(zone, auditReport);
-        ctx.ui.notify("✓ Health Map updated", "info");
+        ctx.ui.notify("✓ Verify completed (audit report ready)", "info");
     });
 }
