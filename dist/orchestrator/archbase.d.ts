@@ -31,6 +31,9 @@ export declare const paths: {
         triage: string;
         auditReport: string;
         archUpdateProposal: string;
+        lock: string;
+        logsDir: string;
+        runLogCurrent: string;
     };
     agents: string;
 };

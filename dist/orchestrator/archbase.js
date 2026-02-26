@@ -87,6 +87,9 @@ exports.paths = {
         triage: `${ARCHBASE}/workflow/TRIAGE.md`,
         auditReport: `${ARCHBASE}/workflow/audit-report-current.md`,
         archUpdateProposal: `${ARCHBASE}/workflow/arch-update-proposal.md`,
+        lock: `${ARCHBASE}/workflow/.lock`,
+        logsDir: `${ARCHBASE}/workflow/logs`,
+        runLogCurrent: `${ARCHBASE}/workflow/logs/run-current.log`,
     },
     agents: `${ARCHBASE}/AGENTS.md`,
 };
@@ -111,18 +114,23 @@ function init(repoName) {
     writeIfNotExists(exports.paths.health.metrics, "# Architecture Metrics\n");
     writeIfNotExists(exports.paths.decisions.index, "# DDR Index\n");
     writeIfNotExists(exports.paths.workflow.auditReport, "");
-    writeWorkflowState({
-        status: "idle",
-        updatedAt: new Date().toISOString(),
-    });
-    const initialMap = {
-        version: "1.0",
-        repo: repoName,
-        zones: {},
-        updatedAt: new Date().toISOString(),
-    };
-    writeHealthMap(initialMap);
-    const agentsContent = `# ArchAgent Project Context
+    if (!exists(exports.paths.workflow.state)) {
+        writeWorkflowState({
+            status: "idle",
+            updatedAt: new Date().toISOString(),
+        });
+    }
+    if (!exists(exports.paths.health.map)) {
+        const initialMap = {
+            version: "1.0",
+            repo: repoName,
+            zones: {},
+            updatedAt: new Date().toISOString(),
+        };
+        writeHealthMap(initialMap);
+    }
+    if (!exists(exports.paths.agents)) {
+        const agentsContent = `# ArchAgent Project Context
 
 This project uses ArchAgent for architecture-aware AI assistance.
 For full capabilities, use the /arch:task command to launch the pipeline.
@@ -136,7 +144,8 @@ ${readIfExists(exports.paths.knowledge.constraints)}
 ## Conventions
 ${readIfExists(exports.paths.knowledge.conventions)}
 `;
-    write(exports.paths.agents, agentsContent);
+        write(exports.paths.agents, agentsContent);
+    }
 }
 function readHealthMap() {
     if (!fs.existsSync(exports.paths.health.map))
