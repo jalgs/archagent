@@ -1,11 +1,48 @@
 {
   "name": "archagent",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "version": "0.1.0",
+  "description": "Architecture-aware multi-agent system for senior developers, built as a Pi Package",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "src",
+    "skills",
+    "templates"
+  ],
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
-  "author": "",
-  "license": "ISC",
-  "description": ""
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "pi:install": "npm run build && pi install .",
+    "pi:install:project": "npm run build && pi install -l .",
+    "pi:remove": "pi remove \"$PWD\"",
+    "pi:remove:project": "pi remove -l \"$PWD\"",
+    "pi:reinstall": "npm run build && (pi remove \"$PWD\" || true) && pi install .",
+    "pi:reinstall:project": "npm run build && (pi remove -l \"$PWD\" || true) && pi install -l ."
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@sinclair/typebox": "*"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
 }
